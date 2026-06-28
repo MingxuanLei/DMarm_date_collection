@@ -58,11 +58,11 @@ GRAVITY_TORQUE_SCALE = [0.0, 1.5, 1.35, 3.0, 3.0, 0.0]
 
 DEFAULT_PV_TARGET_DH_Q = [
     3.10,
-    -1.7,
+    -1.6,
     -3.1,
-    -0.1,
+    0.0,
     1.56,
-    -2.7,
+    0.25,
 ]
 DEFAULT_PV_MOVE_VEL_LIM = 0.4
 DEFAULT_TOOL_TARGET_Q = -2.9
