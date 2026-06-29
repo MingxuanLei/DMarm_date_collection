@@ -1,0 +1,2372 @@
+import argparse
+import csv
+import inspect
+import math
+import os
+import queue
+import threading
+import time
+from types import MethodType
+from datetime import datetime
+import numpy as np
+
+from intelrealsense_episode_recorder import D435iRecorder
+
+from zlgcan import ZCAN, ZCAN_USBCANFD_MINI
+from GUIyemian_7motors import (
+    ArmController,
+    MODE_MIT,
+    MODE_PV,
+    GRAVITY_COMP_PERIOD_S,
+    GRAVITY_TORQUE_SCALE,
+)
+# =========================
+# 1. CANFD 序列号配置
+# =========================
+MASTER_SERIAL = "9820ECA9B0E80D6418B0"
+SLAVE_SERIAL = "4671C41C400E09D49180"
+
+DEVICE_SCAN_MAX = 3
+CHANNEL_INDEX = 0
+# =========================
+# 2. 遥操作参数
+# =========================
+CONTROL_HZ = 500.0
+PV_VEL_LIM = 0.8
+
+# 第一次实验建议先小一点，例如 0.005~0.02
+MAX_DELTA_PER_CYCLE = 0.02
+
+# 低通滤波系数
+ALPHA = 0.20
+
+# 如果某个关节方向相反，把对应项改成 -1。
+# 这里只对应前 6 个机械臂关节，保持原功能不变。
+SCALE = np.array([1, 1, 1, 1, 1, 1], dtype=float)
+
+# =========================
+# 2.1 第 7 个工具电机遥操作参数
+# =========================
+
+# 是否启用第 7 个工具电机遥操作
+ENABLE_TOOL_TELEOP = True
+
+# 第 7 个工具电机的主从映射比例；方向相反时改成 -1.0
+TOOL_SCALE = 2.0
+
+# 第 7 个工具电机单周期最大变化量，单位 rad
+TOOL_MAX_DELTA_PER_CYCLE = 0.02
+
+# 第 7 个工具电机低通滤波系数
+TOOL_ALPHA = 0.20
+
+# 第 7 个工具电机 PV 速度限制，默认与前 6 轴相同
+TOOL_PV_VEL_LIM = PV_VEL_LIM
+
+# 电机目标夹紧时离边界留一点余量，单位 rad
+MOTOR_LIMIT_MARGIN = 0.003
+
+# 每隔多少次循环打印一次夹紧信息，避免刷屏
+CLIP_PRINT_INTERVAL = 100
+
+# 是否打印安全夹紧信息
+PRINT_CLIP_INFO = True
+
+# 夹紧量超过该阈值时才认为值得打印，单位 rad
+CLIP_PRINT_MIN_DELTA = 0.03
+
+# =========================
+# 3. 弱双向反馈参数
+# =========================
+# 弱双向含义：
+# 主端 -> 从端：主端关节角驱动从端 PV 跟随
+# 从端 -> 主端：从端跟踪误差和电机反馈力矩，转换成主端 MIT 反馈力矩
+
+ENABLE_WEAK_BILATERAL = True
+
+# 是否启用从端“位置跟踪误差”反馈
+ENABLE_ERROR_FEEDBACK = True
+
+# 是否启用从端“电机反馈力矩”反馈
+ENABLE_TORQUE_FEEDBACK = True
+
+# 启动遥操作前，自动采集一段从端空载/静止时的电机力矩作为零偏
+AUTO_ZERO_SLAVE_TORQUE = True
+SLAVE_TORQUE_ZERO_TIME_S = 0.5
+SLAVE_TORQUE_ZERO_SAMPLE_HZ = 100.0
+
+# 误差反馈：q_error = q_target - q_slave
+# 若从端因为碰到物体、限位或阻力而跟不上目标，q_error 会变大；
+# 主端反馈力矩默认取 -K * q_error，用来阻碍操作者继续往该方向推。
+ERROR_FB_GAIN = np.array([0.80, 0.80, 0.60, 0.18, 0.15, 0.10], dtype=float)
+
+# 误差死区，单位 rad。小误差不反馈，避免从端正常滞后造成主端抖动。
+ERROR_FB_DEADZONE = np.array([0.015, 0.015, 0.015, 0.020, 0.020, 0.020], dtype=float)
+
+# 力矩反馈：使用从端电机反馈力矩减去启动时零偏后的残差。
+# 注意：电机反馈力矩不等价于真实末端接触力，只能作为弱反馈/阻力感来源。
+TORQUE_FB_GAIN = np.array([0.08, 0.08, 0.07, 0.035, 0.030, 0.020], dtype=float)
+
+# 从端电机力矩死区，单位取决于电机反馈 Torque 的单位，一般可先按 N·m 理解。
+TORQUE_FB_DEADZONE = np.array([0.15, 0.15, 0.12, 0.08, 0.06, 0.05], dtype=float)
+
+# 电机力矩反馈方向。
+# 如果你发现“从端受阻时主端反而被助推”，把这个值改为 +1.0。
+# 默认 -1.0 表示产生反向阻力。
+TORQUE_FB_SIGN = -1.0
+
+# 主端反馈力矩最大值，单位与 MIT torque_set 一致。
+# 第一次实验一定要保守，确认方向正确后再逐步增大。
+MASTER_FB_TAU_MAX = np.array([0.80, 0.80, 0.60, 0.30, 0.22, 0.15], dtype=float)
+
+# 主端反馈力矩低通滤波，越小越平滑，越大越跟手。
+FEEDBACK_ALPHA = 0.12
+
+# 反馈力矩总开关掩码；如果某个关节不想反馈，设为 0。
+FEEDBACK_MASK = np.array([1, 1, 1, 1, 1, 1], dtype=float)
+
+# 每隔多少次循环打印一次反馈信息。
+FEEDBACK_PRINT_INTERVAL = 300
+
+
+# =========================
+# 3.1 第 7 个工具电机弱反馈参数
+# =========================
+# 默认关闭第 7 电机弱反馈，只启用第 7 电机位置跟随。
+# 如果确认方向和力矩安全后，可以改为 True。
+ENABLE_TOOL_WEAK_FEEDBACK = True
+
+# 工具电机位置误差反馈参数，单位 rad / torque_set
+TOOL_ERROR_FB_GAIN = 0.05
+TOOL_ERROR_FB_DEADZONE = 0.02
+
+# 工具电机反馈力矩残差反馈参数
+TOOL_TORQUE_FB_GAIN = 0.02
+TOOL_TORQUE_FB_DEADZONE = 0.05
+TOOL_TORQUE_FB_SIGN = -1.0
+
+# 输出到主端第 7 电机的最大反馈力矩，第一次实验建议保守
+TOOL_MASTER_FB_TAU_MAX = 0.08
+
+
+# =========================
+# 3. CANFD 设备扫描函数
+# =========================
+
+def normalize_serial(serial):
+    if serial is None:
+        return ""
+    return str(serial).strip().upper()
+
+def scan_canfd_devices(max_index=8):
+    zcan = ZCAN()
+    devices = {}
+
+    print("=" * 70)
+    print("开始扫描 CANFD 设备...")
+    print("=" * 70)
+
+    for idx in range(max_index):
+        handle = zcan.OpenDevice(ZCAN_USBCANFD_MINI, idx, 0)
+
+        if int(handle) == 0:
+            print(f"device_index={idx}: 打开失败")
+            continue
+
+        info = None
+
+        try:
+            info = zcan.GetDeviceInf(handle)
+        except Exception as e:
+            print(f"device_index={idx}: 读取设备信息异常: {e}")
+        finally:
+            try:
+                zcan.CloseDevice(handle)
+            except Exception:
+                pass
+
+        if info is None:
+            print(f"device_index={idx}: 打开成功，但读取设备信息失败")
+            continue
+
+        serial = normalize_serial(info.serial)
+
+        print(f"device_index={idx}: 打开成功")
+        print(f"  serial  = {serial}")
+        print(f"  hw_type = {info.hw_type}")
+        print(f"  can_num = {info.can_num}")
+
+        if serial:
+            devices[serial] = {
+                "device_index": idx,
+                "hw_type": info.hw_type,
+                "can_num": info.can_num,
+            }
+
+    print("=" * 70)
+    print(f"扫描完成，共发现 {len(devices)} 个可用 CANFD 设备")
+
+    for serial, item in devices.items():
+        print(f"serial={serial}, device_index={item['device_index']}, hw_type={item['hw_type']}")
+
+    print("=" * 70)
+
+    return devices
+
+def get_device_index_by_serial(devices, target_serial, role_name):
+    target_serial = normalize_serial(target_serial)
+
+    if target_serial not in devices:
+        print(f"[ERR] 没有找到 {role_name} CANFD 设备")
+        print(f"[ERR] 目标 serial = {target_serial}")
+        print("[ERR] 当前扫描到的 serial 有：")
+
+        for serial in devices.keys():
+            print(f"  {serial}")
+
+        raise RuntimeError(f"未找到 {role_name} CANFD 设备: serial={target_serial}")
+
+    device_index = devices[target_serial]["device_index"]
+
+    print(f"[OK] {role_name} CANFD 匹配成功")
+    print(f"     serial       = {target_serial}")
+    print(f"     device_index = {device_index}")
+
+    return device_index
+
+# =========================
+# 4. 角度处理函数
+# =========================
+
+def wrap_to_pi(q):
+    q = np.asarray(q, dtype=float)
+    return (q + math.pi) % (2 * math.pi) - math.pi
+
+def angle_diff(q_target, q_now):
+    """
+    返回 q_target - q_now 的最短角度差，范围 [-pi, pi]。
+    注意：这个函数只用于计算差值，不再用于强行包裹绝对目标角。
+    """
+    return wrap_to_pi(np.asarray(q_target, dtype=float) - np.asarray(q_now, dtype=float))
+
+def limit_delta_continuous(q_target, q_last, max_delta):
+    q_target = np.asarray(q_target, dtype=float)
+    q_last = np.asarray(q_last, dtype=float)
+
+    delta = angle_diff(q_target, q_last)
+    delta = np.clip(delta, -max_delta, max_delta)
+
+    return q_last + delta
+
+def lowpass_continuous(q_target, q_last, alpha):
+    q_target = np.asarray(q_target, dtype=float)
+    q_last = np.asarray(q_last, dtype=float)
+
+    delta = angle_diff(q_target, q_last)
+    return q_last + alpha * delta
+
+def deadzone_vector(x, dz):
+    """
+    对向量做死区处理：
+    |x| <= dz 时输出 0；
+    |x| > dz 时输出 sign(x) * (|x|-dz)。
+    """
+    x = np.asarray(x, dtype=float)
+    dz = np.asarray(dz, dtype=float)
+    return np.sign(x) * np.maximum(np.abs(x) - dz, 0.0)
+
+def as_float(x):
+    return float(np.asarray(x, dtype=float).reshape(()))
+
+def get_dh(controller):
+    snapshot = controller.get_status_snapshot()
+
+    if snapshot is None:
+        return None
+
+    return np.array(snapshot["dh_rad"], dtype=float)
+
+def get_motor_torque(controller):
+    snapshot = controller.get_status_snapshot()
+
+    if snapshot is None:
+        return None
+
+    motors = snapshot.get("motors", [])
+    if len(motors) < 6:
+        return None
+
+    return np.array([float(m["tau"]) for m in motors[:6]], dtype=float)
+
+
+def get_slave_actual_joint_velocity(controller):
+    """
+    读取从端前 6 个实际 DH 关节速度，单位 rad/s。
+
+    DMMotor.Velocity 是电机侧反馈速度；Robot.motor2dh() 中 DH 角满足：
+        dh = motor_position / ratio + zero_offset
+    因此 DH 关节速度对应：
+        dh_velocity = motor_velocity / ratio
+    这样记录下来的速度方向与 CSV 中 slave_actual_q1~q6 的 DH 关节角方向一致。
+    """
+    snapshot = controller.get_status_snapshot()
+
+    if snapshot is None or controller is None or controller.robot is None:
+        return None
+
+    motors = snapshot.get("motors", [])
+    if len(motors) < 6:
+        return None
+
+    motor_vel = np.array([float(m["vel"]) for m in motors[:6]], dtype=float)
+    ratio = np.asarray(controller.robot.ratio, dtype=float).reshape(6)
+
+    # 防止极端情况下 ratio 中出现 0。
+    ratio = np.where(np.abs(ratio) < 1.0e-12, 1.0, ratio)
+    return motor_vel / ratio
+
+# =========================
+# 4.1 第 7 个工具电机状态函数
+# =========================
+
+def get_tool_motor(controller):
+    if controller is None or controller.can is None:
+        return None
+    tools = getattr(controller.can, "tools", [])
+    if not tools:
+        return None
+    return tools[0]
+
+def get_tool_position(controller):
+    tool = get_tool_motor(controller)
+    if tool is None:
+        return None
+    return float(tool.Position)
+
+def get_tool_torque(controller):
+    tool = get_tool_motor(controller)
+    if tool is None:
+        return None
+    return float(tool.Torque)
+
+
+def get_tool_velocity(controller):
+    """读取第 7 个工具电机实际速度，单位 rad/s。"""
+    tool = get_tool_motor(controller)
+    if tool is None:
+        return None
+    return float(tool.Velocity)
+
+def check_7motor_controller(controller, role_name):
+    """确认当前导入的 ArmController 版本真正支持 1~7 号电机。"""
+    if not hasattr(controller, "all_actuators"):
+        raise RuntimeError(
+            f"{role_name} 当前导入的 ArmController 仍是 6 电机版本。\n"
+            "请把之前生成的 GUIyemian_7motors.py 放到当前目录，"
+            "或者把 7 电机版 GUI 文件命名/替换为 GUIyemian.py。"
+        )
+
+    sig = inspect.signature(controller.set_pv_target_motor_position)
+    if "tool_target_q" not in sig.parameters:
+        raise RuntimeError(
+            f"{role_name} 的 set_pv_target_motor_position() 不支持 tool_target_q 参数。\n"
+            "请使用支持第 7 个工具电机的 GUI 控制器文件。"
+        )
+
+# =========================
+# 5. 从端安全目标写入
+# =========================
+
+def dh_to_motor_near_current_clamped(controller, target_dh, margin=0.003):
+    """
+    将目标 DH 角转换为前 6 个机械臂电机角。
+
+    与 robot.dh2motor() 的区别：
+    1. 会优先选择最接近当前电机位置的 2pi 等效电机角；
+    2. 如果目标略微超出电机限位，会夹紧到限位内部；
+    3. 适合遥操作连续跟随，避免实际反馈在边界附近造成反复超限。
+    """
+    if controller.can is None or controller.robot is None:
+        raise RuntimeError("controller 尚未初始化")
+
+    target_dh = np.asarray(target_dh, dtype=float).reshape(6)
+
+    ratio = np.asarray(controller.robot.ratio, dtype=float)
+    zero_offset = np.asarray(controller.robot.zero_offset, dtype=float)
+
+    motor_target = np.zeros(6, dtype=float)
+    clip_infos = []
+
+    for i, motor in enumerate(controller.can.motors):
+        lo = float(motor.angle_lim[0])
+        hi = float(motor.angle_lim[1])
+
+        # 原始 DH -> motor
+        raw = (target_dh[i] - zero_offset[i]) * ratio[i]
+
+        # 选择与当前电机反馈最接近的等效角
+        current_motor = float(motor.Position)
+        candidates = np.array([raw, raw + 2.0 * math.pi, raw - 2.0 * math.pi], dtype=float)
+
+        valid_candidates = [c for c in candidates if lo + margin <= c <= hi - margin]
+
+        if valid_candidates:
+            chosen = min(valid_candidates, key=lambda x: abs(x - current_motor))
+            clipped = chosen
+            was_clipped = False
+        else:
+            chosen = min(candidates, key=lambda x: abs(x - current_motor))
+            clipped = float(np.clip(chosen, lo + margin, hi - margin))
+            was_clipped = abs(clipped - chosen) > 1e-9
+
+        motor_target[i] = clipped
+
+        if was_clipped:
+            clip_infos.append({
+                "joint": i + 1,
+                "dh": float(target_dh[i]),
+                "raw_motor": float(chosen),
+                "clipped_motor": float(clipped),
+                "limit": [lo, hi],
+            })
+
+    return motor_target, clip_infos
+
+def tool_to_motor_near_current_clamped(controller, target_tool_q, margin=0.003):
+    """
+    第 7 个工具电机不属于 6 轴 DH 模型，直接按电机角进行主从映射。
+    这里同样选择最接近当前电机位置的 2pi 等效角，并做限位夹紧。
+    """
+    tool = get_tool_motor(controller)
+    if tool is None:
+        raise RuntimeError("未检测到第 7 个工具电机")
+
+    lo = float(tool.angle_lim[0])
+    hi = float(tool.angle_lim[1])
+    raw = float(target_tool_q)
+    current_tool = float(tool.Position)
+
+    candidates = np.array([raw, raw + 2.0 * math.pi, raw - 2.0 * math.pi], dtype=float)
+    valid_candidates = [c for c in candidates if lo + margin <= c <= hi - margin]
+
+    if valid_candidates:
+        chosen = min(valid_candidates, key=lambda x: abs(x - current_tool))
+        clipped = chosen
+        was_clipped = False
+    else:
+        chosen = min(candidates, key=lambda x: abs(x - current_tool))
+        clipped = float(np.clip(chosen, lo + margin, hi - margin))
+        was_clipped = abs(clipped - chosen) > 1e-9
+
+    clip_infos = []
+    if was_clipped:
+        clip_infos.append({
+            "joint": 7,
+            "dh": None,
+            "raw_motor": float(chosen),
+            "clipped_motor": float(clipped),
+            "limit": [lo, hi],
+        })
+
+    return float(clipped), clip_infos
+
+def print_clip_infos(clip_infos, loop_count):
+    large_clip_infos = [
+        item for item in clip_infos
+        if abs(item["clipped_motor"] - item["raw_motor"]) >= CLIP_PRINT_MIN_DELTA
+    ]
+
+    if not (PRINT_CLIP_INFO and large_clip_infos and loop_count % CLIP_PRINT_INTERVAL == 0):
+        return
+
+    print("[INFO] 从端目标接近或超过电机限位，已进行安全夹紧：")
+    for item in large_clip_infos:
+        name = "工具电机7" if item["joint"] == 7 else f"关节{item['joint']}"
+        print(
+            f"  {name}: "
+            f"raw_motor={item['raw_motor']:.4f}, "
+            f"clipped={item['clipped_motor']:.4f}, "
+            f"limit=[{item['limit'][0]:.4f}, {item['limit'][1]:.4f}]"
+        )
+
+def safe_set_slave_target_7d(slave, target_dh, target_tool_q, velocity_lim, tool_velocity_lim, loop_count=0):
+    """
+    从端安全写入目标：
+    1~6 号：DH 角 -> 电机角，必要时夹紧；
+    7 号：工具电机角直接映射，必要时夹紧；
+    然后统一写入 PV 目标。
+    """
+    try:
+        motor_target, clip_infos_6 = dh_to_motor_near_current_clamped(slave, target_dh, MOTOR_LIMIT_MARGIN)
+        tool_target, clip_infos_7 = tool_to_motor_near_current_clamped(slave, target_tool_q, MOTOR_LIMIT_MARGIN)
+
+        print_clip_infos(clip_infos_6 + clip_infos_7, loop_count)
+
+        # 这里要求 ArmController 使用 7 电机版本：
+        # set_pv_target_motor_position(target_motor_q, velocity_lim, tool_target_q=...)
+        ok = slave.set_pv_target_motor_position(
+            motor_target.tolist(),
+            velocity_lim,
+            tool_target_q=tool_target,
+        )
+
+        return ok, float(tool_target)
+
+    except Exception as e:
+        print(f"[WARN] safe_set_slave_target_7d 异常: {e}")
+        return False, None
+
+
+
+# =========================
+# 7. 主端弱双向反馈力矩叠加
+# =========================
+
+def enable_master_external_feedback(controller):
+    """
+    给主端 ArmController 增加外部反馈力矩通道。
+
+    前 6 轴：tau_master = tau_g + external_feedback_tau
+    第 7 轴：默认零力矩；若 ENABLE_TOOL_WEAK_FEEDBACK=True，则叠加 external_tool_feedback_tau
+
+    注意：这个函数必须在 master.initialize_system() 之前调用，
+    因为 initialize_system() 内部会启动重力补偿线程。
+    """
+    controller.external_feedback_tau = np.zeros(6, dtype=float)
+    controller.external_tool_feedback_tau = 0.0
+    controller.external_feedback_lock = threading.RLock()
+
+    def set_external_feedback_tau(self, tau, tool_tau=0.0):
+        tau_arr = np.asarray(tau, dtype=float).reshape(-1)
+        if tau_arr.size < 6:
+            raise ValueError("tau 至少需要包含前 6 个关节的反馈力矩")
+        with self.external_feedback_lock:
+            self.external_feedback_tau = tau_arr[:6].copy()
+            if tau_arr.size >= 7:
+                self.external_tool_feedback_tau = float(tau_arr[6])
+            else:
+                self.external_tool_feedback_tau = float(tool_tau)
+
+    def get_external_feedback_tau(self):
+        with self.external_feedback_lock:
+            return np.concatenate([
+                self.external_feedback_tau.copy(),
+                np.array([self.external_tool_feedback_tau], dtype=float),
+            ])
+
+    def _pack_mit_command(self, motor):
+        if hasattr(self, "pack_command_for_mode"):
+            self.pack_command_for_mode(motor, MODE_MIT)
+        else:
+            motor.set()
+
+    def gravity_comp_loop_with_feedback(self):
+        assert self.can is not None
+        assert self.robot is not None
+
+        self.log("[GRAVITY] 重力补偿线程已启动：tau = tau_g + 弱双向反馈力矩，第7电机默认零力矩")
+
+        while not self.gravity_stop_event.is_set():
+            try:
+                with self.data_lock:
+                    self.robot.Angle = self.robot.motor2dh(self.can.motors)
+
+                    if not self.robot.set_robot():
+                        time.sleep(GRAVITY_COMP_PERIOD_S)
+                        continue
+
+                    tau_g_motor = self.robot.Tau_G_Motor
+
+                    with self.external_feedback_lock:
+                        tau_fb = self.external_feedback_tau.copy()
+                        tau_tool_fb = float(self.external_tool_feedback_tau)
+
+                    for i, motor in enumerate(self.can.motors):
+                        motor.MIT.position_set = 0.0
+                        motor.MIT.velocity_set = 0.0
+                        motor.MIT.kp_set = 0.0
+                        motor.MIT.kd_set = 0.0
+                        motor.MIT.torque_set = float(tau_g_motor[i] * GRAVITY_TORQUE_SCALE[i] + tau_fb[i])
+                        _pack_mit_command(self, motor)
+
+                    for tool in getattr(self.can, "tools", []):
+                        tool.MIT.position_set = 0.0
+                        tool.MIT.velocity_set = 0.0
+                        tool.MIT.kp_set = 0.0
+                        tool.MIT.kd_set = 0.0
+                        tool.MIT.torque_set = float(tau_tool_fb if ENABLE_TOOL_WEAK_FEEDBACK else 0.0)
+                        _pack_mit_command(self, tool)
+
+                time.sleep(GRAVITY_COMP_PERIOD_S)
+
+            except Exception as e:
+                self.log(f"[ERR] 重力补偿/反馈线程异常: {e}")
+                time.sleep(0.01)
+
+        self.log("[GRAVITY] 重力补偿/反馈线程退出")
+
+    controller.set_external_feedback_tau = MethodType(set_external_feedback_tau, controller)
+    controller.get_external_feedback_tau = MethodType(get_external_feedback_tau, controller)
+    controller.gravity_comp_loop = MethodType(gravity_comp_loop_with_feedback, controller)
+
+
+def measure_slave_torque_zero(slave, sample_time_s=0.5, sample_hz=100.0):
+    """
+    采集从端静止时的电机反馈力矩均值作为零偏。
+    这样后续反馈使用 tau_slave - tau_zero，避免把静态保持力矩一直反馈到主端。
+    """
+    samples = []
+    dt = 1.0 / max(float(sample_hz), 1.0)
+    end_time = time.time() + float(sample_time_s)
+
+    print(f"[ZERO] 开始采集从端电机力矩零偏，持续 {sample_time_s:.2f}s...")
+
+    while time.time() < end_time:
+        tau = get_motor_torque(slave)
+        if tau is not None and tau.shape == (6,):
+            samples.append(tau.copy())
+        time.sleep(dt)
+
+    if not samples:
+        print("[WARN] 从端电机力矩零偏采集失败，使用 0 作为零偏")
+        return np.zeros(6, dtype=float)
+
+    tau_zero = np.mean(np.vstack(samples), axis=0)
+
+    print("[ZERO] 从端电机力矩零偏:")
+    print(["{:.4f}".format(x) for x in tau_zero])
+
+    return tau_zero
+
+
+
+def measure_slave_tool_torque_zero(slave, sample_time_s=0.5, sample_hz=100.0):
+    """采集从端第 7 个工具电机静止时的反馈力矩均值作为零偏。"""
+    samples = []
+    dt = 1.0 / max(float(sample_hz), 1.0)
+    end_time = time.time() + float(sample_time_s)
+
+    print(f"[ZERO] 开始采集从端第7工具电机力矩零偏，持续 {sample_time_s:.2f}s...")
+
+    while time.time() < end_time:
+        tau = get_tool_torque(slave)
+        if tau is not None:
+            samples.append(float(tau))
+        time.sleep(dt)
+
+    if not samples:
+        print("[WARN] 从端第7工具电机力矩零偏采集失败，使用 0 作为零偏")
+        return 0.0
+
+    tau_zero = float(np.mean(samples))
+    print(f"[ZERO] 从端第7工具电机力矩零偏: {tau_zero:.4f}")
+    return tau_zero
+
+
+def compute_weak_bilateral_feedback(q_target, q_slave, tau_slave, tau_slave_zero, tau_fb_last):
+    """
+    根据从端反馈计算主端外部反馈力矩。
+
+    输入：
+        q_target: 当前给从端的目标 DH 角
+        q_slave: 从端当前 DH 角
+        tau_slave: 从端当前电机反馈力矩
+        tau_slave_zero: 从端静止零偏力矩
+        tau_fb_last: 上一次输出到主端的反馈力矩
+
+    输出：
+        tau_fb: 当前输出到主端 MIT 的反馈力矩
+        info: 诊断信息
+    """
+    tau_fb_total = np.zeros(6, dtype=float)
+
+    q_error = angle_diff(q_target, q_slave)
+    q_error_eff = deadzone_vector(q_error, ERROR_FB_DEADZONE)
+
+    tau_from_error = np.zeros(6, dtype=float)
+    if ENABLE_ERROR_FEEDBACK:
+        # q_error 为正：从端实际落后于正方向目标，主端施加反向阻力
+        tau_from_error = -ERROR_FB_GAIN * SCALE * q_error_eff
+        tau_fb_total += tau_from_error
+
+    tau_residual = np.zeros(6, dtype=float)
+    tau_residual_eff = np.zeros(6, dtype=float)
+    tau_from_torque = np.zeros(6, dtype=float)
+
+    if ENABLE_TORQUE_FEEDBACK and tau_slave is not None:
+        tau_residual = np.asarray(tau_slave, dtype=float).reshape(6) - np.asarray(tau_slave_zero, dtype=float).reshape(6)
+        tau_residual_eff = deadzone_vector(tau_residual, TORQUE_FB_DEADZONE)
+
+        # TORQUE_FB_SIGN 默认 -1，如果发现方向反了，改成 +1
+        tau_from_torque = TORQUE_FB_SIGN * TORQUE_FB_GAIN * SCALE * tau_residual_eff
+        tau_fb_total += tau_from_torque
+
+    tau_fb_total *= FEEDBACK_MASK
+    tau_fb_total = np.clip(tau_fb_total, -MASTER_FB_TAU_MAX, MASTER_FB_TAU_MAX)
+
+    # 对反馈力矩做低通滤波，避免主端手感发抖
+    tau_fb = np.asarray(tau_fb_last, dtype=float).reshape(6) + FEEDBACK_ALPHA * (
+        tau_fb_total - np.asarray(tau_fb_last, dtype=float).reshape(6)
+    )
+
+    info = {
+        "q_error": q_error,
+        "q_error_eff": q_error_eff,
+        "tau_slave": tau_slave,
+        "tau_residual": tau_residual,
+        "tau_residual_eff": tau_residual_eff,
+        "tau_from_error": tau_from_error,
+        "tau_from_torque": tau_from_torque,
+        "tau_fb_raw": tau_fb_total,
+        "tau_fb": tau_fb,
+    }
+
+    return tau_fb, info
+
+
+def compute_tool_weak_bilateral_feedback(q_tool_target, q_tool_slave, tau_tool_slave, tau_tool_zero, tau_tool_fb_last):
+    """
+    第 7 个工具电机的弱反馈。默认由 ENABLE_TOOL_WEAK_FEEDBACK 控制，
+    不影响前 6 轴原有弱双向反馈算法。
+    """
+    q_error = as_float(angle_diff(q_tool_target, q_tool_slave))
+    q_error_eff = as_float(deadzone_vector(q_error, TOOL_ERROR_FB_DEADZONE))
+
+    tau_from_error = 0.0
+    if ENABLE_ERROR_FEEDBACK:
+        tau_from_error = -float(TOOL_ERROR_FB_GAIN) * float(TOOL_SCALE) * q_error_eff
+
+    tau_residual = 0.0
+    tau_residual_eff = 0.0
+    tau_from_torque = 0.0
+
+    if ENABLE_TORQUE_FEEDBACK and tau_tool_slave is not None:
+        tau_residual = float(tau_tool_slave) - float(tau_tool_zero)
+        tau_residual_eff = as_float(deadzone_vector(tau_residual, TOOL_TORQUE_FB_DEADZONE))
+        tau_from_torque = float(TOOL_TORQUE_FB_SIGN) * float(TOOL_TORQUE_FB_GAIN) * float(TOOL_SCALE) * tau_residual_eff
+
+    tau_fb_raw = tau_from_error + tau_from_torque
+    tau_fb_raw = float(np.clip(tau_fb_raw, -TOOL_MASTER_FB_TAU_MAX, TOOL_MASTER_FB_TAU_MAX))
+    tau_fb = float(tau_tool_fb_last) + FEEDBACK_ALPHA * (tau_fb_raw - float(tau_tool_fb_last))
+
+    info = {
+        "q_error": q_error,
+        "q_error_eff": q_error_eff,
+        "tau_tool_slave": tau_tool_slave,
+        "tau_residual": tau_residual,
+        "tau_residual_eff": tau_residual_eff,
+        "tau_from_error": tau_from_error,
+        "tau_from_torque": tau_from_torque,
+        "tau_fb_raw": tau_fb_raw,
+        "tau_fb": tau_fb,
+    }
+
+    return tau_fb, info
+
+
+# =========================
+# 6. 遥操作示教参数
+# =========================
+
+# 四种运行模式：
+# 0) prepare：采集前准备模式，只初始化主从机械臂，允许PV预定位，不做遥操作/记录；
+# 1) teleop：普通遥操作模式，只遥操作不记录；
+# 2) record：遥操作记录模式，遥操作同时保存从端轨迹和从端实际关节速度；
+# 3) replay：示教回放模式，读取记录文件并让从端自动复现。
+RUN_MODE_PREPARE = "prepare"
+RUN_MODE_TELEOP = "teleop"
+RUN_MODE_RECORD = "record"
+RUN_MODE_REPLAY = "replay"
+
+CMD_EXIT = "0"
+CMD_TELEOP = "1"
+CMD_RECORD = "2"
+CMD_REPLAY = "3"
+CMD_PREPARE = "4"
+
+# 发送到准备模式队列的PV预定位命令使用 dict，避免和字符串模式命令混淆。
+PV_CMD_TYPE = "pv_move"
+PV_TARGET_MASTER = "master"
+PV_TARGET_SLAVE = "slave"
+PV_TARGET_BOTH = "both"
+
+CMD_TO_MODE = {
+    CMD_PREPARE: RUN_MODE_PREPARE,
+    CMD_TELEOP: RUN_MODE_TELEOP,
+    CMD_RECORD: RUN_MODE_RECORD,
+    CMD_REPLAY: RUN_MODE_REPLAY,
+}
+
+MODE_TO_CMD = {
+    RUN_MODE_PREPARE: CMD_PREPARE,
+    RUN_MODE_TELEOP: CMD_TELEOP,
+    RUN_MODE_RECORD: CMD_RECORD,
+    RUN_MODE_REPLAY: CMD_REPLAY,
+}
+
+MODE_CN_NAME = {
+    RUN_MODE_PREPARE: "采集前准备模式",
+    RUN_MODE_TELEOP: "遥操作模式",
+    RUN_MODE_RECORD: "遥操作记录模式",
+    RUN_MODE_REPLAY: "示教回放模式",
+}
+
+# 数据统一保存到本脚本所在目录下的 data 文件夹。
+# 每次进入“遥操作记录模式”时自动创建一个新的 episode_xx：
+#   data/episode_00/trajectory/teach_record_时间.csv
+#   data/episode_00/video/teach_record_时间_color.mp4
+#   data/episode_00/video/teach_record_时间_camera_timestamps.csv
+#   data/episode_00/video/teach_record_时间_camera_meta.json
+# 其中 xx 按已有 episode 文件夹自动递增，第一次记录为 episode_00。
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(SCRIPT_DIR, "data")
+EPISODE_PREFIX = "episode_"
+EPISODE_DIGITS = 2
+
+# 兼容旧代码/旧界面中对 TRAJECTORY_DIR、VIDEO_DIR 的引用。
+# 真实记录目录会在每次进入记录模式时动态生成到 data/episode_xx 下。
+TRAJECTORY_DIR = os.path.join(DATA_DIR, "episode_xx", "trajectory")
+VIDEO_DIR = os.path.join(DATA_DIR, "episode_xx", "video")
+LEGACY_TRAJECTORY_DIR = os.path.join(DATA_DIR, "trajectory")
+LEGACY_VIDEO_DIR = os.path.join(DATA_DIR, "video")
+
+# D435i RGB 同步录制开关。
+ENABLE_D435I_RECORDING = True
+D435I_COLOR_WIDTH = 640
+D435I_COLOR_HEIGHT = 480
+D435I_FPS = 30
+
+# 保存本次程序运行过程中最近一次记录的文件名，便于记录后直接切换到回放。
+LAST_RECORD_FILE = None
+
+
+def ensure_data_dirs():
+    """确保 data 根目录存在，并返回其绝对路径。"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    return DATA_DIR
+
+
+def _parse_episode_index(name):
+    """从 episode_xx 文件夹名中解析编号；不是合法 episode 名称时返回 None。"""
+    if not isinstance(name, str) or not name.startswith(EPISODE_PREFIX):
+        return None
+    suffix = name[len(EPISODE_PREFIX):]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def list_episode_dirs():
+    """返回 [(episode_index, episode_dir), ...]，按编号升序排列。"""
+    ensure_data_dirs()
+    episodes = []
+    try:
+        for name in os.listdir(DATA_DIR):
+            idx = _parse_episode_index(name)
+            if idx is None:
+                continue
+            path = os.path.join(DATA_DIR, name)
+            if os.path.isdir(path):
+                episodes.append((idx, path))
+    except Exception:
+        return []
+    return sorted(episodes, key=lambda x: x[0])
+
+
+def get_next_episode_index():
+    """根据 data 目录下已有 episode_xx 文件夹，返回下一次记录应使用的编号。"""
+    episodes = list_episode_dirs()
+    if not episodes:
+        return 0
+    return max(idx for idx, _ in episodes) + 1
+
+
+def format_episode_name(index):
+    """将编号格式化为 episode_00、episode_01 ..."""
+    return f"{EPISODE_PREFIX}{int(index):0{EPISODE_DIGITS}d}"
+
+
+def make_episode_dirs(index=None):
+    """创建并返回一个 episode 目录及其 trajectory/video 子目录。"""
+    ensure_data_dirs()
+    if index is None:
+        index = get_next_episode_index()
+
+    # 若极端情况下目录已存在，则继续向后寻找，避免覆盖已有记录。
+    while True:
+        episode_name = format_episode_name(index)
+        episode_dir = os.path.join(DATA_DIR, episode_name)
+        trajectory_dir = os.path.join(episode_dir, "trajectory")
+        video_dir = os.path.join(episode_dir, "video")
+        if not os.path.exists(episode_dir):
+            break
+        # 如果目录存在但两个子目录为空，也仍然不复用，避免误覆盖。
+        index += 1
+
+    os.makedirs(trajectory_dir, exist_ok=True)
+    os.makedirs(video_dir, exist_ok=True)
+    return {
+        "episode_index": int(index),
+        "episode_name": episode_name,
+        "episode_dir": episode_dir,
+        "trajectory_dir": trajectory_dir,
+        "video_dir": video_dir,
+    }
+
+
+def _is_inside_episode_trajectory(record_file):
+    """判断 record_file 是否已经位于 data/episode_xx/trajectory 下。"""
+    if record_file is None:
+        return False
+    try:
+        abs_path = os.path.abspath(str(record_file))
+        trajectory_dir = os.path.dirname(abs_path)
+        episode_dir = os.path.dirname(trajectory_dir)
+        data_dir = os.path.dirname(episode_dir)
+        if os.path.basename(trajectory_dir) != "trajectory":
+            return False
+        if os.path.abspath(data_dir) != os.path.abspath(DATA_DIR):
+            return False
+        return _parse_episode_index(os.path.basename(episode_dir)) is not None
+    except Exception:
+        return False
+
+
+def _episode_dirs_from_record_file(record_file):
+    """从 data/episode_xx/trajectory/xxx.csv 推导出本 episode 的路径信息。"""
+    abs_path = os.path.abspath(str(record_file))
+    trajectory_dir = os.path.dirname(abs_path)
+    episode_dir = os.path.dirname(trajectory_dir)
+    episode_name = os.path.basename(episode_dir)
+    episode_index = _parse_episode_index(episode_name)
+    video_dir = os.path.join(episode_dir, "video")
+    os.makedirs(trajectory_dir, exist_ok=True)
+    os.makedirs(video_dir, exist_ok=True)
+    return {
+        "episode_index": int(episode_index),
+        "episode_name": episode_name,
+        "episode_dir": episode_dir,
+        "trajectory_dir": trajectory_dir,
+        "video_dir": video_dir,
+    }
+
+
+def _make_record_basename(record_file=None):
+    """生成本次 CSV 文件名；若用户指定文件名，只使用其 basename。"""
+    if record_file is None or str(record_file).strip() == "":
+        time_str = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        return f"teach_record_{time_str}.csv"
+
+    filename = os.path.basename(str(record_file).strip())
+    if not filename.lower().endswith(".csv"):
+        filename += ".csv"
+    return filename
+
+
+def create_episode_record_paths(record_file=None):
+    """
+    为一次“遥操作记录模式”创建 episode_xx，并返回本次 CSV 与视频目录。
+
+    注意：每调用一次并且 record_file 不是已位于 data/episode_xx/trajectory 下，
+    就会新建下一个 episode。这个函数应只在真正开始记录时调用。
+    """
+    if _is_inside_episode_trajectory(record_file):
+        dirs = _episode_dirs_from_record_file(record_file)
+        filename = os.path.basename(str(record_file).strip())
+    else:
+        dirs = make_episode_dirs()
+        filename = _make_record_basename(record_file)
+
+    record_path = os.path.join(dirs["trajectory_dir"], filename)
+    record_stem = os.path.splitext(os.path.basename(record_path))[0]
+    out = dict(dirs)
+    out.update({"record_file": record_path, "record_stem": record_stem})
+    return out
+
+
+def ensure_trajectory_dir():
+    """兼容旧接口：确保 data 根目录存在，并返回提示用的 episode_xx/trajectory 路径。"""
+    ensure_data_dirs()
+    return TRAJECTORY_DIR
+
+
+def ensure_video_dir():
+    """兼容旧接口：确保 data 根目录存在，并返回提示用的 episode_xx/video 路径。"""
+    ensure_data_dirs()
+    return VIDEO_DIR
+
+
+def make_teach_record_filename():
+    """兼容旧接口：创建一个新的 episode，并返回其中的默认轨迹文件路径。"""
+    return create_episode_record_paths(None)["record_file"]
+
+
+def resolve_record_file_path(record_file=None):
+    """
+    兼容旧接口：为一次新的记录创建 episode_xx，并返回 CSV 路径。
+
+    GUI/主循环里不要提前反复调用本函数；推荐把原始 record_file 传给
+    run_teleop_record_session()，由 enter_record_mode() 在真正开始记录时调用。
+    """
+    return create_episode_record_paths(record_file)["record_file"]
+
+
+def resolve_replay_file_path(replay_file=None):
+    """
+    解析回放文件路径：
+    1. 如果给的是可直接访问的完整路径，则直接使用；
+    2. 如果只给了文件名，则优先从 data/episode_*/trajectory 中查找；
+    3. 兼容旧路径 data/trajectory 和 trajectory；
+    4. 如果都不存在，返回 None。
+    """
+    if replay_file is None or str(replay_file).strip() == "":
+        return None
+
+    replay_file = str(replay_file).strip()
+    if os.path.exists(replay_file):
+        return replay_file
+
+    filename = os.path.basename(replay_file)
+    candidates = []
+
+    for _, episode_dir in list_episode_dirs():
+        item = os.path.join(episode_dir, "trajectory", filename)
+        if os.path.exists(item):
+            candidates.append(item)
+
+    for folder in (LEGACY_TRAJECTORY_DIR, os.path.join(SCRIPT_DIR, "trajectory")):
+        item = os.path.join(folder, filename)
+        if os.path.exists(item):
+            candidates.append(item)
+
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def _collect_csv_files_in_folder(folder):
+    candidates = []
+    try:
+        if not os.path.isdir(folder):
+            return candidates
+        for name in os.listdir(folder):
+            if name.lower().endswith(".csv"):
+                item_path = os.path.join(folder, name)
+                if os.path.isfile(item_path):
+                    candidates.append(item_path)
+    except Exception:
+        pass
+    return candidates
+
+
+def find_latest_teach_record_file(folder=None):
+    """自动寻找最新 episode 中的 CSV；兼容旧 data/trajectory 与 trajectory 目录。"""
+    candidates = []
+
+    if folder is not None:
+        candidates.extend(_collect_csv_files_in_folder(folder))
+        return max(candidates, key=os.path.getmtime) if candidates else None
+
+    # 优先按 episode 编号搜索 data/episode_xx/trajectory。
+    episode_candidates = []
+    for idx, episode_dir in list_episode_dirs():
+        traj_dir = os.path.join(episode_dir, "trajectory")
+        for item in _collect_csv_files_in_folder(traj_dir):
+            episode_candidates.append((idx, os.path.getmtime(item), item))
+
+    if episode_candidates:
+        episode_candidates.sort(key=lambda x: (x[0], x[1]))
+        return episode_candidates[-1][2]
+
+    # 没有 episode 数据时，兼容旧目录。
+    for old_folder in (LEGACY_TRAJECTORY_DIR, os.path.join(SCRIPT_DIR, "trajectory")):
+        candidates.extend(_collect_csv_files_in_folder(old_folder))
+
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+# 控制循环是 500Hz，完整记录会比较大；每 5 个控制周期记录一次，即约 100Hz。
+# 如果希望完全逐周期记录，把该值改成 1。
+RECORD_EVERY_N_CYCLES = 5
+
+# 回放源：
+# actual 表示优先回放记录到的从端实际轨迹；
+# target 表示回放当时写给从端的目标轨迹，一般更平滑。
+REPLAY_SOURCE = "actual"
+
+# 回放前，从当前位姿平滑运动到轨迹起点的时间。
+REPLAY_PREPARE_TIME_S = 3.0
+REPLAY_PREPARE_HZ = 200.0
+
+# 回放速度比例：1.0 表示按记录时原速度；2.0 表示两倍速；0.5 表示半速。
+REPLAY_SPEED_SCALE = 1.0
+
+# 回放结束后保持最后一个轨迹点的时间。
+REPLAY_HOLD_LAST_S = 1.0
+
+CSV_FIELDS = (
+    ["time_s", "loop_count"]
+    + [f"master_q{i}" for i in range(1, 7)]
+    + [f"slave_target_q{i}" for i in range(1, 7)]
+    + [f"slave_actual_q{i}" for i in range(1, 7)]
+    + [f"slave_actual_v{i}" for i in range(1, 7)]
+    + ["master_tool", "slave_tool_target", "slave_tool_actual", "slave_tool_actual_vel"]
+)
+
+# =========================
+# 7. 键盘命令与记录/回放工具函数
+# =========================
+
+def print_command_menu():
+    print()
+    print("================== 键盘命令 ==================")
+    print("  1 - 切换到遥操作模式")
+    print("  2 - 切换到遥操作记录模式")
+    print("  3 - 切换到示教回放模式")
+    print("  0 - 安全退出程序")
+    print("  h - 显示本菜单")
+    print("说明：程序运行过程中，直接在终端输入数字并回车即可切换。")
+    print("==============================================")
+    print()
+
+
+def choose_initial_command():
+    print_command_menu()
+    while True:
+        choice = input("请选择初始模式 4/1/2/3，或输入 0 退出：").strip().lower()
+        if choice in (CMD_EXIT, CMD_PREPARE, CMD_TELEOP, CMD_RECORD, CMD_REPLAY):
+            return choice
+        if choice in ("h", "help", "?"):
+            print_command_menu()
+            continue
+        print("[WARN] 输入无效，请输入 4、1、2、3 或 0。")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="七电机弱双向力反馈同构遥操作、遥操作记录与示教回放程序")
+    parser.add_argument(
+        "--mode",
+        choices=[RUN_MODE_PREPARE, RUN_MODE_TELEOP, RUN_MODE_RECORD, RUN_MODE_REPLAY, "menu"],
+        default="menu",
+        help="初始运行模式：prepare=采集前PV预定位准备，teleop=只遥操作，record=遥操作并记录，replay=示教回放，menu=启动时菜单选择",
+    )
+    parser.add_argument("--record-file", default=None, help="记录模式保存的 CSV 文件名，默认保存到 data/episode_xx/trajectory 文件夹")
+    parser.add_argument("--replay-file", default=None, help="回放模式读取的 CSV 文件路径；若只写文件名，则优先从 data/episode_xx/trajectory 文件夹查找")
+    parser.add_argument("--replay-source", choices=["actual", "target"], default=REPLAY_SOURCE, help="回放从端实际轨迹 actual 或目标轨迹 target")
+    parser.add_argument("--replay-speed", type=float, default=REPLAY_SPEED_SCALE, help="回放速度倍率，1.0 为原速")
+    parser.add_argument("--no-camera-record", action="store_true", help="记录模式下不启动 D435i RGB 同步视频录制")
+    return parser.parse_args()
+
+
+def start_keyboard_listener(cmd_queue, stop_event):
+    """
+    后台键盘监听线程。
+
+    这样控制循环不再被 input() 阻塞，运行遥操作/记录/回放时也可以随时输入：
+        1：遥操作
+        2：记录
+        3：回放
+        0：退出
+    """
+    def _worker():
+        while not stop_event.is_set():
+            try:
+                cmd = input().strip().lower()
+            except EOFError:
+                cmd_queue.put(CMD_EXIT)
+                break
+            except Exception:
+                continue
+
+            if not cmd:
+                continue
+
+            if cmd in (CMD_EXIT, CMD_PREPARE, CMD_TELEOP, CMD_RECORD, CMD_REPLAY):
+                cmd_queue.put(cmd)
+            elif cmd in ("h", "help", "?"):
+                print_command_menu()
+            else:
+                print("[WARN] 无效命令，请输入 4/1/2/3 切换模式，或输入 0 退出。")
+
+    th = threading.Thread(target=_worker, name="keyboard_command_listener", daemon=True)
+    th.start()
+    return th
+
+
+def drain_latest_command(cmd_queue):
+    """取出队列中最后一个命令，避免连续输入时堆积旧命令。"""
+    latest = None
+    while True:
+        try:
+            latest = cmd_queue.get_nowait()
+        except queue.Empty:
+            break
+    return latest
+
+
+def wait_for_next_command(cmd_queue, message="请输入 4/1/2/3 切换模式，或输入 0 退出："):
+    print()
+    print(message)
+    while True:
+        cmd = drain_latest_command(cmd_queue)
+        if cmd in (CMD_EXIT, CMD_PREPARE, CMD_TELEOP, CMD_RECORD, CMD_REPLAY):
+            return cmd
+        time.sleep(0.05)
+
+
+def fmt_float(x, ndigits=8):
+    if x is None:
+        return ""
+    try:
+        x = float(x)
+    except Exception:
+        return ""
+    if not math.isfinite(x):
+        return ""
+    return f"{x:.{ndigits}f}"
+
+
+def open_record_writer(record_file):
+    folder = os.path.dirname(os.path.abspath(record_file))
+    if folder and not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+
+    f = open(record_file, "w", newline="", encoding="utf-8-sig")
+    writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+    writer.writeheader()
+    return f, writer
+
+
+def close_record_writer(record_handle, record_file):
+    global LAST_RECORD_FILE
+
+    if record_handle is None:
+        return
+    try:
+        record_handle.flush()
+        record_handle.close()
+        LAST_RECORD_FILE = record_file
+        print(f"[RECORD] 轨迹文件已保存: {record_file}")
+    except Exception as e:
+        print(f"[WARN] 关闭轨迹文件异常: {e}")
+
+
+def write_record_row(
+    writer,
+    record_start_time,
+    loop_count,
+    q_master,
+    q_target,
+    q_slave_actual,
+    q_slave_actual_vel,
+    q_master_tool,
+    q_tool_target,
+    q_slave_tool_actual,
+    q_slave_tool_actual_vel,
+):
+    row = {
+        "time_s": fmt_float(time.time() - record_start_time),
+        "loop_count": int(loop_count),
+        "master_tool": fmt_float(q_master_tool),
+        "slave_tool_target": fmt_float(q_tool_target),
+        "slave_tool_actual": fmt_float(q_slave_tool_actual),
+        "slave_tool_actual_vel": fmt_float(q_slave_tool_actual_vel),
+    }
+
+    q_master = np.asarray(q_master, dtype=float).reshape(6)
+    q_target = np.asarray(q_target, dtype=float).reshape(6)
+
+    if q_slave_actual is None:
+        q_slave_actual = [math.nan] * 6
+    q_slave_actual = np.asarray(q_slave_actual, dtype=float).reshape(6)
+
+    if q_slave_actual_vel is None:
+        q_slave_actual_vel = [math.nan] * 6
+    q_slave_actual_vel = np.asarray(q_slave_actual_vel, dtype=float).reshape(6)
+
+    for i in range(6):
+        row[f"master_q{i + 1}"] = fmt_float(q_master[i])
+        row[f"slave_target_q{i + 1}"] = fmt_float(q_target[i])
+        row[f"slave_actual_q{i + 1}"] = fmt_float(q_slave_actual[i])
+        row[f"slave_actual_v{i + 1}"] = fmt_float(q_slave_actual_vel[i])
+
+    writer.writerow(row)
+
+
+def _float_from_row(row, key, default=math.nan):
+    value = row.get(key, "")
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _vector_from_row(row, prefix):
+    values = [_float_from_row(row, f"{prefix}{i}") for i in range(1, 7)]
+    arr = np.asarray(values, dtype=float)
+    if not np.all(np.isfinite(arr)):
+        return None
+    return arr
+
+
+def load_teach_trajectory(csv_file, replay_source="actual"):
+    if not os.path.exists(csv_file):
+        raise FileNotFoundError(f"轨迹文件不存在: {csv_file}")
+
+    points = []
+    with open(csv_file, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            t = _float_from_row(row, "time_s")
+            if not math.isfinite(t):
+                continue
+
+            if replay_source == "target":
+                q = _vector_from_row(row, "slave_target_q")
+                tool = _float_from_row(row, "slave_tool_target")
+            else:
+                q = _vector_from_row(row, "slave_actual_q")
+                tool = _float_from_row(row, "slave_tool_actual")
+
+                # 如果某一行实际轨迹缺失，则退回目标轨迹，避免整段轨迹无法回放。
+                if q is None:
+                    q = _vector_from_row(row, "slave_target_q")
+                if not math.isfinite(tool):
+                    tool = _float_from_row(row, "slave_tool_target")
+
+            if q is None:
+                continue
+            if not math.isfinite(tool):
+                tool = 0.0
+
+            points.append({
+                "time_s": float(t),
+                "q": q.astype(float),
+                "tool": float(tool),
+            })
+
+    if not points:
+        raise RuntimeError(f"轨迹文件中没有有效轨迹点: {csv_file}")
+
+    points.sort(key=lambda item: item["time_s"])
+    return points
+
+
+def init_master_slave_for_teleop():
+    devices = scan_canfd_devices(DEVICE_SCAN_MAX)
+
+    master_index = get_device_index_by_serial(devices, MASTER_SERIAL, "主端")
+    slave_index = get_device_index_by_serial(devices, SLAVE_SERIAL, "从端")
+
+    if master_index == slave_index:
+        raise RuntimeError("主端和从端匹配到了同一个 device_index，请检查 serial 配置")
+
+    print()
+    print("最终设备匹配结果：")
+    print(f"  主端 CANFD: serial={MASTER_SERIAL}, device_index={master_index}")
+    print(f"  从端 CANFD: serial={SLAVE_SERIAL}, device_index={slave_index}")
+    print()
+
+    master = ArmController(device_index=master_index, channel_index=CHANNEL_INDEX, name="master")
+    slave = ArmController(device_index=slave_index, channel_index=CHANNEL_INDEX, name="slave")
+
+    # 在主端初始化前替换重力补偿线程，使 MIT 模式可叠加从端弱双向反馈力矩。
+    enable_master_external_feedback(master)
+
+    if ENABLE_TOOL_TELEOP or ENABLE_TOOL_WEAK_FEEDBACK:
+        check_7motor_controller(master, "主端")
+        check_7motor_controller(slave, "从端")
+
+    print("初始化主端机械臂...")
+    if not master.initialize_system():
+        raise RuntimeError("主端初始化失败")
+
+    print("初始化从端机械臂...")
+    if not slave.initialize_system():
+        raise RuntimeError("从端初始化失败")
+
+    return master, slave
+
+
+def init_slave_for_replay():
+    devices = scan_canfd_devices(DEVICE_SCAN_MAX)
+    slave_index = get_device_index_by_serial(devices, SLAVE_SERIAL, "从端")
+
+    print()
+    print("最终设备匹配结果：")
+    print(f"  从端 CANFD: serial={SLAVE_SERIAL}, device_index={slave_index}")
+    print()
+
+    slave = ArmController(device_index=slave_index, channel_index=CHANNEL_INDEX, name="slave")
+
+    if ENABLE_TOOL_TELEOP:
+        check_7motor_controller(slave, "从端")
+
+    print("初始化从端机械臂...")
+    if not slave.initialize_system():
+        raise RuntimeError("从端初始化失败")
+
+    return slave
+
+
+def prepare_teleoperation(master, slave):
+    time.sleep(1.0)
+
+    q_master_home = get_dh(master)
+    q_slave_home = get_dh(slave)
+
+    if q_master_home is None or q_slave_home is None:
+        raise RuntimeError("无法读取初始关节角")
+
+    q_master_tool_home = get_tool_position(master)
+    q_slave_tool_home = get_tool_position(slave)
+
+    if ENABLE_TOOL_TELEOP and (q_master_tool_home is None or q_slave_tool_home is None):
+        raise RuntimeError("无法读取第 7 个工具电机初始角度")
+
+    print()
+    print("主端初始 DH 角 rad:")
+    print(["{:.4f}".format(x) for x in q_master_home])
+
+    print("从端初始 DH 角 rad:")
+    print(["{:.4f}".format(x) for x in q_slave_home])
+
+    if ENABLE_TOOL_TELEOP:
+        print(f"主端第 7 工具电机初始角 rad: {q_master_tool_home:.4f}")
+        print(f"从端第 7 工具电机初始角 rad: {q_slave_tool_home:.4f}")
+    print()
+
+    print("主端切换到 MIT 模式...")
+    if not master.switch_mode(MODE_MIT, None, PV_VEL_LIM):
+        raise RuntimeError("主端切换 MIT 模式失败")
+
+    print("从端切换到 PV 模式...")
+    # 不用 q_slave_home 作为 PV 目标，因为 q_slave_home 反算成电机角时可能略微越过限位。
+    # 这里让从端 1~7 号电机全部先保持当前位置。
+    if not slave.switch_mode(MODE_PV, None, PV_VEL_LIM):
+        raise RuntimeError("从端切换 PV 模式失败")
+
+    tau_slave_zero = np.zeros(6, dtype=float)
+    tau_slave_tool_zero = 0.0
+
+    if AUTO_ZERO_SLAVE_TORQUE:
+        tau_slave_zero = measure_slave_torque_zero(
+            slave,
+            sample_time_s=SLAVE_TORQUE_ZERO_TIME_S,
+            sample_hz=SLAVE_TORQUE_ZERO_SAMPLE_HZ,
+        )
+        if ENABLE_TOOL_WEAK_FEEDBACK:
+            tau_slave_tool_zero = measure_slave_tool_torque_zero(
+                slave,
+                sample_time_s=SLAVE_TORQUE_ZERO_TIME_S,
+                sample_hz=SLAVE_TORQUE_ZERO_SAMPLE_HZ,
+            )
+
+    return {
+        "q_master_home": q_master_home,
+        "q_slave_home": q_slave_home,
+        "q_master_tool_home": q_master_tool_home,
+        "q_slave_tool_home": q_slave_tool_home,
+        "q_cmd_last": q_slave_home.copy(),
+        "q_tool_cmd_last": float(q_slave_tool_home) if ENABLE_TOOL_TELEOP else 0.0,
+        "tau_slave_zero": tau_slave_zero,
+        "tau_slave_tool_zero": tau_slave_tool_zero,
+        "tau_fb_last": np.zeros(6, dtype=float),
+        "tau_tool_fb_last": 0.0,
+    }
+
+
+def _normalize_dh6(value, name="target_dh_q"):
+    """把输入的DH目标角转换成6元素float列表。"""
+    if value is None:
+        raise ValueError(f"{name} 不能为空")
+    q = np.asarray(value, dtype=float).reshape(6)
+    return [float(x) for x in q]
+
+
+def _maybe_float(value):
+    return None if value is None else float(value)
+
+
+def make_pv_move_command(
+    target,
+    target_dh_q=None,
+    pv_vel=None,
+    tool_target_q=None,
+    *,
+    master_target_dh_q=None,
+    slave_target_dh_q=None,
+    master_pv_vel=None,
+    slave_pv_vel=None,
+    master_tool_target_q=None,
+    slave_tool_target_q=None,
+):
+    """构造准备模式下使用的PV预定位命令。
+
+    兼容两种用法：
+    1. 旧用法：make_pv_move_command(target, target_dh_q, pv_vel, tool_target_q)
+       主端、从端或主从同时使用同一套目标。
+    2. 新用法：主端和从端分别传入不同目标：
+       master_target_dh_q / slave_target_dh_q，
+       master_pv_vel / slave_pv_vel，
+       master_tool_target_q / slave_tool_target_q。
+    """
+    target = str(target).lower()
+
+    # 旧字段作为默认值，保证之前的GUI/命令仍可使用。
+    if pv_vel is None:
+        pv_vel = PV_VEL_LIM
+
+    if target == PV_TARGET_MASTER:
+        q_master = master_target_dh_q if master_target_dh_q is not None else target_dh_q
+        return {
+            "type": PV_CMD_TYPE,
+            "target": PV_TARGET_MASTER,
+            "master_target_dh_q": _normalize_dh6(q_master, "master_target_dh_q"),
+            "master_pv_vel": float(master_pv_vel if master_pv_vel is not None else pv_vel),
+            "master_tool_target_q": _maybe_float(master_tool_target_q if master_tool_target_q is not None else tool_target_q),
+        }
+
+    if target == PV_TARGET_SLAVE:
+        q_slave = slave_target_dh_q if slave_target_dh_q is not None else target_dh_q
+        return {
+            "type": PV_CMD_TYPE,
+            "target": PV_TARGET_SLAVE,
+            "slave_target_dh_q": _normalize_dh6(q_slave, "slave_target_dh_q"),
+            "slave_pv_vel": float(slave_pv_vel if slave_pv_vel is not None else pv_vel),
+            "slave_tool_target_q": _maybe_float(slave_tool_target_q if slave_tool_target_q is not None else tool_target_q),
+        }
+
+    if target == PV_TARGET_BOTH:
+        q_master = master_target_dh_q if master_target_dh_q is not None else target_dh_q
+        q_slave = slave_target_dh_q if slave_target_dh_q is not None else target_dh_q
+        return {
+            "type": PV_CMD_TYPE,
+            "target": PV_TARGET_BOTH,
+            "master_target_dh_q": _normalize_dh6(q_master, "master_target_dh_q"),
+            "slave_target_dh_q": _normalize_dh6(q_slave, "slave_target_dh_q"),
+            "master_pv_vel": float(master_pv_vel if master_pv_vel is not None else pv_vel),
+            "slave_pv_vel": float(slave_pv_vel if slave_pv_vel is not None else pv_vel),
+            "master_tool_target_q": _maybe_float(master_tool_target_q if master_tool_target_q is not None else tool_target_q),
+            "slave_tool_target_q": _maybe_float(slave_tool_target_q if slave_tool_target_q is not None else tool_target_q),
+        }
+
+    raise ValueError(f"未知PV目标对象: {target}")
+
+
+def is_pv_move_command(cmd):
+    return isinstance(cmd, dict) and cmd.get("type") == PV_CMD_TYPE
+
+
+def _format_q_list(q):
+    return ["{:.4f}".format(float(x)) for x in np.asarray(q, dtype=float).reshape(6)]
+
+
+def move_controller_to_fixed_pv(controller, role_name, target_dh_q, pv_vel, tool_target_q=None):
+    """让单个ArmController通过PV模式移动到固定DH关节角。"""
+    if controller is None:
+        print(f"[PV][ERR] {role_name}控制器不存在，无法执行PV预定位")
+        return False
+
+    q = np.asarray(target_dh_q, dtype=float).reshape(6)
+    pv_vel = float(pv_vel)
+    tool_msg = "保持当前位置" if tool_target_q is None else f"{float(tool_target_q):.4f} rad"
+
+    print()
+    print(f"[PV] {role_name}准备移动到固定DH关节角")
+    print(f"[PV] {role_name}目标DH rad: {_format_q_list(q)}")
+    print(f"[PV] {role_name}PV速度限制: {pv_vel:.3f}")
+    print(f"[PV] {role_name}第7工具电机: {tool_msg}")
+
+    ok = bool(controller.switch_mode(MODE_PV, q.tolist(), pv_vel, tool_target_q))
+    if ok:
+        print(f"[PV][OK] {role_name}已切换到PV模式并写入固定目标。到位后会保持PV模式。")
+    else:
+        print(f"[PV][ERR] {role_name}PV固定目标执行失败，请检查目标角、限位和电机状态。")
+    return ok
+
+
+def _get_cmd_value(cmd, new_key, old_key=None, default=None):
+    if new_key in cmd:
+        return cmd.get(new_key)
+    if old_key is not None and old_key in cmd:
+        return cmd.get(old_key)
+    return default
+
+
+def handle_prepare_pv_command(master, slave, cmd):
+    """在准备模式下处理主端/从端/主从PV预定位命令。
+
+    新版本支持主端和从端分别使用不同的DH目标角、PV速度限制和第7工具电机目标角。
+    """
+    if not is_pv_move_command(cmd):
+        return False
+
+    target = str(cmd.get("target", "")).lower()
+
+    if target == PV_TARGET_MASTER:
+        target_dh_q = _get_cmd_value(cmd, "master_target_dh_q", "target_dh_q")
+        pv_vel = float(_get_cmd_value(cmd, "master_pv_vel", "pv_vel", PV_VEL_LIM))
+        tool_target_q = _get_cmd_value(cmd, "master_tool_target_q", "tool_target_q")
+        if target_dh_q is None:
+            print("[PV][ERR] 未提供主端目标DH关节角")
+            return False
+        return move_controller_to_fixed_pv(master, "主端", target_dh_q, pv_vel, tool_target_q)
+
+    if target == PV_TARGET_SLAVE:
+        target_dh_q = _get_cmd_value(cmd, "slave_target_dh_q", "target_dh_q")
+        pv_vel = float(_get_cmd_value(cmd, "slave_pv_vel", "pv_vel", PV_VEL_LIM))
+        tool_target_q = _get_cmd_value(cmd, "slave_tool_target_q", "tool_target_q")
+        if target_dh_q is None:
+            print("[PV][ERR] 未提供从端目标DH关节角")
+            return False
+        return move_controller_to_fixed_pv(slave, "从端", target_dh_q, pv_vel, tool_target_q)
+
+    if target == PV_TARGET_BOTH:
+        master_target_dh_q = _get_cmd_value(cmd, "master_target_dh_q", "target_dh_q")
+        slave_target_dh_q = _get_cmd_value(cmd, "slave_target_dh_q", "target_dh_q")
+        master_pv_vel = float(_get_cmd_value(cmd, "master_pv_vel", "pv_vel", PV_VEL_LIM))
+        slave_pv_vel = float(_get_cmd_value(cmd, "slave_pv_vel", "pv_vel", PV_VEL_LIM))
+        master_tool_target_q = _get_cmd_value(cmd, "master_tool_target_q", "tool_target_q")
+        slave_tool_target_q = _get_cmd_value(cmd, "slave_tool_target_q", "tool_target_q")
+
+        if master_target_dh_q is None or slave_target_dh_q is None:
+            print("[PV][ERR] 主从同时预定位需要同时提供主端和从端目标DH关节角")
+            return False
+
+        results = {"master": False, "slave": False}
+
+        def _move_master():
+            results["master"] = move_controller_to_fixed_pv(
+                master,
+                "主端",
+                master_target_dh_q,
+                master_pv_vel,
+                master_tool_target_q,
+            )
+
+        def _move_slave():
+            results["slave"] = move_controller_to_fixed_pv(
+                slave,
+                "从端",
+                slave_target_dh_q,
+                slave_pv_vel,
+                slave_tool_target_q,
+            )
+
+        print("[PV] 主从同时预定位：主端和从端将并行切换到各自PV固定目标")
+        print(f"[PV] 主端目标DH rad: {_format_q_list(master_target_dh_q)}")
+        print(f"[PV] 从端目标DH rad: {_format_q_list(slave_target_dh_q)}")
+        th_master = threading.Thread(target=_move_master, name="pv_prepare_master", daemon=True)
+        th_slave = threading.Thread(target=_move_slave, name="pv_prepare_slave", daemon=True)
+        th_master.start()
+        th_slave.start()
+        th_master.join()
+        th_slave.join()
+
+        ok = bool(results["master"] and results["slave"])
+        print(f"[PV] 主从同时预定位结果：{'成功' if ok else '存在失败'}")
+        return ok
+
+    print(f"[PV][ERR] 未知PV目标对象: {target}")
+    return False
+
+def run_prepare_session(cmd_queue, record_file=None, enable_camera_recording=None, camera_recorder=None):
+    """采集前准备模式。
+
+    本模式只初始化主端/从端机械臂并等待GUI命令：
+    - PV预定位命令：主端/从端/主从移动到固定DH关节角，保持PV模式；
+    - 1/2：切换到遥操作/记录，会重新建立主从遥操作参考；
+    - 3：清理主从后进入回放；
+    - 0：安全退出。
+    """
+    master = None
+    slave = None
+    next_cmd = CMD_EXIT
+
+    if enable_camera_recording is None:
+        enable_camera_recording = ENABLE_D435I_RECORDING
+
+    try:
+        master, slave = init_master_slave_for_teleop()
+
+        print()
+        print("[PREPARE] 已进入采集前准备模式")
+        print("[PREPARE] 可通过GUI按钮让主端/从端/主从同时以PV模式移动到固定DH关节角。")
+        print("[PREPARE] PV到位后保持PV模式；之后请手动点击 1 遥操作模式或 2 记录模式开始采集。")
+        print("[PREPARE] 切入遥操作/记录时会重新读取当前主从角度作为映射参考，避免PV预定位后跳变。")
+        print("[PREPARE] 运行中可输入 1/2/3 切换，或输入 0 安全退出。")
+        print()
+
+        while True:
+            cmd = drain_latest_command(cmd_queue)
+            if cmd is None:
+                time.sleep(0.05)
+                continue
+
+            if is_pv_move_command(cmd):
+                handle_prepare_pv_command(master, slave, cmd)
+                continue
+
+            if cmd == CMD_EXIT:
+                print("[CMD] 收到 0：准备安全退出")
+                next_cmd = CMD_EXIT
+                break
+
+            if cmd == CMD_REPLAY:
+                print("[CMD] 收到 3：准备切换到示教回放模式")
+                next_cmd = CMD_REPLAY
+                break
+
+            if cmd in (CMD_TELEOP, CMD_RECORD):
+                mode = CMD_TO_MODE[cmd]
+                print(f"[CMD] 收到 {cmd}：从准备模式切换到 {MODE_CN_NAME[mode]}")
+                # 复用已经初始化好的主从控制器。run_teleop_record_session 会重新调用
+                # prepare_teleoperation(master, slave)，从当前PV到位姿态建立新的遥操作参考。
+                next_cmd = run_teleop_record_session(
+                    cmd_queue,
+                    mode,
+                    record_file,
+                    enable_camera_recording=enable_camera_recording,
+                    camera_recorder=camera_recorder,
+                    master=master,
+                    slave=slave,
+                    cleanup_on_exit=True,
+                )
+                # 控制器清理由 run_teleop_record_session 的 finally 负责，避免重复清理。
+                master = None
+                slave = None
+                break
+
+            if cmd == CMD_PREPARE:
+                print("[PREPARE] 当前已经在采集前准备模式")
+                continue
+
+            print(f"[WARN] 准备模式收到未知命令: {cmd}")
+
+    except KeyboardInterrupt:
+        print()
+        print("[WARN] 检测到 Ctrl+C，中断准备模式。")
+        next_cmd = CMD_EXIT
+
+    finally:
+        if master is not None and hasattr(master, "set_external_feedback_tau"):
+            try:
+                master.set_external_feedback_tau(np.zeros(6, dtype=float), tool_tau=0.0)
+                time.sleep(0.05)
+            except Exception:
+                pass
+
+        if slave is not None:
+            print("清理从端机械臂...")
+            try:
+                slave.cleanup()
+            except Exception as e:
+                print(f"[WARN] 从端清理异常: {e}")
+
+        if master is not None:
+            print("清理主端机械臂...")
+            try:
+                master.cleanup()
+            except Exception as e:
+                print(f"[WARN] 主端清理异常: {e}")
+
+    return next_cmd
+
+
+def compute_slave_target_from_master(master, state):
+    q_master = get_dh(master)
+    if q_master is None:
+        return None
+
+    q_master_home = state["q_master_home"]
+    q_slave_home = state["q_slave_home"]
+    q_cmd_last = state["q_cmd_last"]
+
+    # 只对“主端相对变化量”做 wrap，不再对从端绝对目标角整体 wrap。
+    delta_master = angle_diff(q_master, q_master_home)
+
+    # 从端目标 DH 角，保持连续形式。
+    q_target_raw = q_slave_home + SCALE * delta_master
+
+    # 单周期限幅，防止目标突变。
+    q_target = limit_delta_continuous(q_target_raw, q_cmd_last, MAX_DELTA_PER_CYCLE)
+
+    # 低通滤波，使从端运动更平滑。
+    q_target = lowpass_continuous(q_target, q_cmd_last, ALPHA)
+
+    q_tool_target = state["q_tool_cmd_last"]
+    q_master_tool = None
+
+    if ENABLE_TOOL_TELEOP:
+        q_master_tool = get_tool_position(master)
+        if q_master_tool is None:
+            return None
+
+        # 第 7 个工具电机不走 DH，直接用主端工具电机相对变化量映射到从端工具电机。
+        delta_tool = as_float(angle_diff(q_master_tool, state["q_master_tool_home"]))
+        q_tool_target_raw = state["q_slave_tool_home"] + TOOL_SCALE * delta_tool
+
+        q_tool_target = limit_delta_continuous(q_tool_target_raw, state["q_tool_cmd_last"], TOOL_MAX_DELTA_PER_CYCLE)
+        q_tool_target = lowpass_continuous(q_tool_target, state["q_tool_cmd_last"], TOOL_ALPHA)
+        q_tool_target = as_float(q_tool_target)
+
+    return q_master, q_target, q_master_tool, q_tool_target
+
+
+def make_record_stem(record_file):
+    """根据 CSV 文件名生成 D435i 视频文件名前缀。"""
+    return os.path.splitext(os.path.basename(str(record_file)))[0]
+
+
+def create_d435i_recorder(enable_camera_recording=True):
+    """创建并预启动 D435i RGB 录制器。失败时返回 None，不影响遥操作。"""
+    if not enable_camera_recording:
+        print("[D435i] 本次未启用 D435i RGB 同步录制")
+        return None
+
+    recorder = D435iRecorder(
+        enable=True,
+        color_width=D435I_COLOR_WIDTH,
+        color_height=D435I_COLOR_HEIGHT,
+        fps=D435I_FPS,
+    )
+
+    if not recorder.start_camera():
+        print("[D435i][WARN] D435i RGB相机启动失败，本次只记录机械臂 CSV，不录制视频")
+        try:
+            recorder.close()
+        except Exception:
+            pass
+        return None
+
+    return recorder
+
+
+def enter_record_mode(record_file, camera_recorder=None):
+    """进入记录模式：创建新的 episode_xx，打开 CSV，并同步启动 D435i RGB 录制。"""
+    paths = create_episode_record_paths(record_file)
+    active_record_file = paths["record_file"]
+    record_handle, writer = open_record_writer(active_record_file)
+    record_start_time = time.time()
+
+    print()
+    print(f"[MODE] 已切换到遥操作记录模式")
+    print(f"[EPISODE] 本次记录编号: {paths['episode_name']}")
+    print(f"[EPISODE] episode目录: {paths['episode_dir']}")
+    print(f"[RECORD] 已开始记录遥操作轨迹: {active_record_file}")
+    print(f"[RECORD] 记录频率约为 {CONTROL_HZ / max(RECORD_EVERY_N_CYCLES, 1):.1f} Hz")
+
+    if camera_recorder is not None:
+        try:
+            ok = camera_recorder.start_record(paths["video_dir"], paths["record_stem"], record_start_time)
+            if not ok:
+                print("[D435i][WARN] 相机视频录制未启动，本次仍会继续保存机械臂 CSV")
+        except Exception as e:
+            print(f"[D435i][WARN] 启动相机录制异常: {e}")
+
+    return record_handle, writer, record_start_time, active_record_file
+
+
+def leave_record_mode(record_handle, active_record_file, camera_recorder=None):
+    if camera_recorder is not None:
+        try:
+            camera_recorder.stop_record()
+        except Exception as e:
+            print(f"[D435i][WARN] 停止相机录制异常: {e}")
+
+    if record_handle is not None:
+        close_record_writer(record_handle, active_record_file)
+    return None, None, None, None
+
+
+def run_teleop_record_session(cmd_queue, initial_mode, record_file, enable_camera_recording=None, camera_recorder=None, master=None, slave=None, cleanup_on_exit=True):
+    """
+    运行遥操作/遥操作记录会话。
+
+    本函数内部允许 1/2 直接切换遥操作与记录，不重新初始化设备；
+    输入 3 时退出本会话并切换到示教回放；
+    输入 0 时安全清理并退出整个程序。
+    """
+    external_master = master is not None
+    external_slave = slave is not None
+    record_handle = None
+    writer = None
+    record_start_time = None
+    active_record_file = None
+    own_camera_recorder = False
+    current_mode = initial_mode
+    next_cmd = CMD_EXIT
+
+    if enable_camera_recording is None:
+        enable_camera_recording = ENABLE_D435I_RECORDING
+
+    try:
+        if master is None or slave is None:
+            master, slave = init_master_slave_for_teleop()
+        else:
+            print("[INFO] 复用准备模式中已初始化的主端/从端机械臂")
+
+        # 每次真正进入遥操作/记录前，都重新读取当前主从角度作为映射参考。
+        # 这样即使之前通过PV预定位到固定姿态，也不会在切入遥操作时发生跳变。
+        state = prepare_teleoperation(master, slave)
+        if enable_camera_recording and camera_recorder is None:
+            camera_recorder = create_d435i_recorder(enable_camera_recording)
+            own_camera_recorder = camera_recorder is not None
+        elif not enable_camera_recording:
+            camera_recorder = None
+
+        if current_mode == RUN_MODE_RECORD:
+            record_handle, writer, record_start_time, active_record_file = enter_record_mode(record_file, camera_recorder=camera_recorder)
+        else:
+            print()
+            print("[MODE] 已进入遥操作模式，不记录轨迹")
+
+        dt = 1.0 / CONTROL_HZ
+        loop_count = 0
+        last_flush_loop = 0
+
+        print()
+        print("主端：MIT 重力补偿 + 从端弱双向反馈力矩")
+        print("从端：PV 模式跟随")
+        print("第 7 个工具电机：" + ("启用主从同构跟随" if ENABLE_TOOL_TELEOP else "未启用"))
+        print(f"弱双向反馈：{'开启' if ENABLE_WEAK_BILATERAL else '关闭'}")
+        print(f"误差反馈：{'开启' if ENABLE_ERROR_FEEDBACK else '关闭'}")
+        print(f"电机力矩反馈：{'开启' if ENABLE_TORQUE_FEEDBACK else '关闭'}")
+        print(f"第7电机弱反馈：{'开启' if ENABLE_TOOL_WEAK_FEEDBACK else '关闭'}")
+        print("运行中可输入 4/1/2/3 切换模式，输入 0 安全退出。")
+        print()
+
+        while True:
+            loop_start = time.time()
+            loop_count += 1
+
+            cmd = drain_latest_command(cmd_queue)
+            if is_pv_move_command(cmd):
+                print("[PV][WARN] 当前正在遥操作/记录模式，禁止执行PV固定定位；请先安全退出当前任务，再进入准备模式。")
+                cmd = None
+
+            if cmd == CMD_EXIT:
+                print("[CMD] 收到 0：准备安全退出")
+                next_cmd = CMD_EXIT
+                break
+            elif cmd == CMD_REPLAY:
+                print("[CMD] 收到 3：准备切换到示教回放模式")
+                next_cmd = CMD_REPLAY
+                break
+            elif cmd == CMD_TELEOP:
+                if current_mode != RUN_MODE_TELEOP:
+                    record_handle, writer, record_start_time, active_record_file = leave_record_mode(record_handle, active_record_file, camera_recorder=camera_recorder)
+                    current_mode = RUN_MODE_TELEOP
+                    print("[MODE] 已切换到遥操作模式，不再记录轨迹")
+                else:
+                    print("[MODE] 当前已经是遥操作模式")
+            elif cmd == CMD_RECORD:
+                if current_mode != RUN_MODE_RECORD:
+                    current_mode = RUN_MODE_RECORD
+                    record_handle, writer, record_start_time, active_record_file = enter_record_mode(record_file, camera_recorder=camera_recorder)
+                    last_flush_loop = loop_count
+                else:
+                    print("[MODE] 当前已经是遥操作记录模式")
+
+            result = compute_slave_target_from_master(master, state)
+            if result is None:
+                time.sleep(dt)
+                continue
+
+            q_master, q_target, q_master_tool, q_tool_target = result
+
+            q_slave_actual = get_dh(slave)
+            q_slave_actual_vel = get_slave_actual_joint_velocity(slave)
+            tau_slave = get_motor_torque(slave)
+            q_slave_tool_actual = get_tool_position(slave) if ENABLE_TOOL_TELEOP else None
+            q_slave_tool_actual_vel = get_tool_velocity(slave) if ENABLE_TOOL_TELEOP else None
+            tau_slave_tool = get_tool_torque(slave) if ENABLE_TOOL_WEAK_FEEDBACK else None
+
+            ok, q_tool_written = safe_set_slave_target_7d(
+                slave,
+                q_target,
+                q_tool_target,
+                PV_VEL_LIM,
+                TOOL_PV_VEL_LIM,
+                loop_count,
+            )
+
+            if ok:
+                state["q_cmd_last"] = q_target.copy()
+                if ENABLE_TOOL_TELEOP and q_tool_written is not None:
+                    state["q_tool_cmd_last"] = float(q_tool_written)
+            else:
+                print("[WARN] 从端目标写入失败，保持当前位置")
+                slave.set_pv_hold_current_position(PV_VEL_LIM)
+
+            # =========================
+            # 从端 -> 主端：弱双向力反馈
+            # =========================
+            if ENABLE_WEAK_BILATERAL and q_slave_actual is not None:
+                tau_fb, fb_info = compute_weak_bilateral_feedback(
+                    q_target=q_target,
+                    q_slave=q_slave_actual,
+                    tau_slave=tau_slave,
+                    tau_slave_zero=state["tau_slave_zero"],
+                    tau_fb_last=state["tau_fb_last"],
+                )
+                state["tau_fb_last"] = tau_fb.copy()
+
+                tau_tool_fb = 0.0
+                tool_fb_info = None
+                if ENABLE_TOOL_WEAK_FEEDBACK and ENABLE_TOOL_TELEOP and q_slave_tool_actual is not None:
+                    tau_tool_fb, tool_fb_info = compute_tool_weak_bilateral_feedback(
+                        q_tool_target=q_tool_target,
+                        q_tool_slave=q_slave_tool_actual,
+                        tau_tool_slave=tau_slave_tool,
+                        tau_tool_zero=state["tau_slave_tool_zero"],
+                        tau_tool_fb_last=state["tau_tool_fb_last"],
+                    )
+                    state["tau_tool_fb_last"] = float(tau_tool_fb)
+
+                master.set_external_feedback_tau(tau_fb, tool_tau=tau_tool_fb)
+
+                if loop_count % FEEDBACK_PRINT_INTERVAL == 0:
+                    print("[FB] 从端反馈 -> 主端 MIT 反馈力矩")
+                    print("  q_error rad       =", ["{:.4f}".format(x) for x in fb_info["q_error"]])
+                    if tau_slave is not None:
+                        print("  tau_slave         =", ["{:.4f}".format(x) for x in tau_slave])
+                        print("  tau_slave-zero    =", ["{:.4f}".format(x) for x in fb_info["tau_residual"]])
+                    print("  tau_fb_to_master  =", ["{:.4f}".format(x) for x in fb_info["tau_fb"]])
+                    if tool_fb_info is not None:
+                        print(f"  tool_q_error      = {tool_fb_info['q_error']:.4f}")
+                        print(f"  tool_tau_fb       = {tool_fb_info['tau_fb']:.4f}")
+            else:
+                master.set_external_feedback_tau(np.zeros(6, dtype=float), tool_tau=0.0)
+
+            if current_mode == RUN_MODE_RECORD and writer is not None and loop_count % max(RECORD_EVERY_N_CYCLES, 1) == 0:
+                if q_slave_actual is None:
+                    q_slave_actual = get_dh(slave)
+                if q_slave_actual_vel is None:
+                    q_slave_actual_vel = get_slave_actual_joint_velocity(slave)
+                if q_slave_tool_actual is None:
+                    q_slave_tool_actual = get_tool_position(slave)
+                if q_slave_tool_actual_vel is None:
+                    q_slave_tool_actual_vel = get_tool_velocity(slave)
+
+                write_record_row(
+                    writer,
+                    record_start_time,
+                    loop_count,
+                    q_master,
+                    q_target,
+                    q_slave_actual,
+                    q_slave_actual_vel,
+                    q_master_tool,
+                    q_tool_target,
+                    q_slave_tool_actual,
+                    q_slave_tool_actual_vel,
+                )
+
+                if loop_count - last_flush_loop >= int(CONTROL_HZ):
+                    record_handle.flush()
+                    last_flush_loop = loop_count
+
+            elapsed = time.time() - loop_start
+            time.sleep(max(0.0, dt - elapsed))
+
+    except KeyboardInterrupt:
+        print()
+        print("[WARN] 检测到 Ctrl+C，中断当前会话。建议正常使用键盘输入 0 退出。")
+        next_cmd = CMD_EXIT
+
+    finally:
+        record_handle, writer, record_start_time, active_record_file = leave_record_mode(record_handle, active_record_file, camera_recorder=camera_recorder)
+
+        if camera_recorder is not None and own_camera_recorder:
+            print("释放 D435i RGB相机...")
+            try:
+                camera_recorder.close()
+            except Exception as e:
+                print(f"[D435i][WARN] 释放RGB相机异常: {e}")
+
+        if cleanup_on_exit:
+            print("清零主端反馈力矩...")
+            try:
+                if master is not None and hasattr(master, "set_external_feedback_tau"):
+                    master.set_external_feedback_tau(np.zeros(6, dtype=float), tool_tau=0.0)
+                    time.sleep(0.05)
+            except Exception as e:
+                print(f"[WARN] 清零主端反馈力矩异常: {e}")
+
+            print("清理从端机械臂...")
+            try:
+                if slave is not None:
+                    slave.cleanup()
+            except Exception as e:
+                print(f"[WARN] 从端清理异常: {e}")
+
+            print("清理主端机械臂...")
+            try:
+                if master is not None:
+                    master.cleanup()
+            except Exception as e:
+                print(f"[WARN] 主端清理异常: {e}")
+        else:
+            print("[INFO] 保留主端/从端控制器，不在本会话结束时清理")
+
+    return next_cmd
+
+
+def move_slave_to_trajectory_start(slave, first_q, first_tool, cmd_queue=None):
+    q_now = get_dh(slave)
+    tool_now = get_tool_position(slave)
+
+    if q_now is None:
+        raise RuntimeError("无法读取从端当前 DH 角，不能移动到轨迹起点")
+    if ENABLE_TOOL_TELEOP and tool_now is None:
+        raise RuntimeError("无法读取从端第 7 工具电机当前角，不能移动到轨迹起点")
+
+    if tool_now is None:
+        tool_now = float(first_tool)
+
+    steps = max(2, int(REPLAY_PREPARE_TIME_S * REPLAY_PREPARE_HZ))
+    dt = 1.0 / REPLAY_PREPARE_HZ
+
+    print()
+    print("[REPLAY] 准备移动到示教轨迹起点...")
+    print("[REPLAY] 当前从端 DH 角 rad:")
+    print(["{:.4f}".format(x) for x in q_now])
+    print("[REPLAY] 轨迹起点 DH 角 rad:")
+    print(["{:.4f}".format(x) for x in first_q])
+    print(f"[REPLAY] 当前工具电机角: {float(tool_now):.4f}, 起点工具电机角: {float(first_tool):.4f}")
+
+    for k in range(steps):
+        if cmd_queue is not None:
+            cmd = drain_latest_command(cmd_queue)
+            if cmd in (CMD_EXIT, CMD_TELEOP, CMD_RECORD, CMD_REPLAY):
+                return cmd
+
+        ratio = (k + 1) / steps
+        q_ref = q_now + ratio * angle_diff(first_q, q_now)
+        tool_ref = float(tool_now) + ratio * as_float(angle_diff(first_tool, tool_now))
+
+        ok, _ = safe_set_slave_target_7d(
+            slave,
+            q_ref,
+            tool_ref,
+            PV_VEL_LIM,
+            TOOL_PV_VEL_LIM,
+            k,
+        )
+        if not ok:
+            raise RuntimeError("移动到示教轨迹起点失败")
+        time.sleep(dt)
+
+    print("[REPLAY] 已到达示教轨迹起点附近")
+    time.sleep(0.3)
+    return None
+
+
+def run_replay_session(cmd_queue, replay_file, replay_source="actual", replay_speed=1.0):
+    """
+    运行示教回放会话。
+
+    输入 1/2 时退出回放并切换到遥操作/记录；
+    输入 3 时重新进入回放；
+    输入 0 时安全退出。
+    """
+    slave = None
+    next_cmd = None
+
+    try:
+        points = load_teach_trajectory(replay_file, replay_source=replay_source)
+        replay_speed = max(float(replay_speed), 1.0e-6)
+
+        print()
+        print(f"[REPLAY] 已读取轨迹文件: {replay_file}")
+        print(f"[REPLAY] 有效轨迹点数量: {len(points)}")
+        print(f"[REPLAY] 回放源: {'从端实际轨迹' if replay_source == 'actual' else '从端目标轨迹'}")
+        print(f"[REPLAY] 回放速度倍率: {replay_speed:.3f}")
+
+        slave = init_slave_for_replay()
+        time.sleep(1.0)
+
+        print("从端切换到 PV 模式...")
+        if not slave.switch_mode(MODE_PV, None, PV_VEL_LIM):
+            raise RuntimeError("从端切换 PV 模式失败")
+
+        first = points[0]
+        prep_cmd = move_slave_to_trajectory_start(slave, first["q"], first["tool"], cmd_queue=cmd_queue)
+        if prep_cmd in (CMD_EXIT, CMD_TELEOP, CMD_RECORD, CMD_REPLAY):
+            next_cmd = prep_cmd
+            return next_cmd
+
+        print()
+        print("[REPLAY] 开始示教回放。运行中可输入 4/1/2/3 切换模式，输入 0 安全退出。")
+        t0 = points[0]["time_s"]
+        replay_start = time.time()
+
+        for idx, point in enumerate(points):
+            cmd = drain_latest_command(cmd_queue)
+            if cmd == CMD_EXIT:
+                print("[CMD] 收到 0：准备安全退出")
+                next_cmd = CMD_EXIT
+                return next_cmd
+            if cmd in (CMD_TELEOP, CMD_RECORD):
+                print(f"[CMD] 收到 {cmd}：准备切换到 {MODE_CN_NAME[CMD_TO_MODE[cmd]]}")
+                next_cmd = cmd
+                return next_cmd
+            if cmd == CMD_REPLAY:
+                print("[CMD] 收到 3：准备重新开始示教回放")
+                next_cmd = CMD_REPLAY
+                return next_cmd
+
+            target_time = (point["time_s"] - t0) / replay_speed
+            wait_time = replay_start + target_time - time.time()
+            if wait_time > 0:
+                # 分段等待，保证等待过程中也能及时响应键盘命令。
+                wait_end = time.time() + wait_time
+                while time.time() < wait_end:
+                    cmd = drain_latest_command(cmd_queue)
+                    if cmd in (CMD_EXIT, CMD_TELEOP, CMD_RECORD, CMD_REPLAY):
+                        next_cmd = cmd
+                        return next_cmd
+                    time.sleep(min(0.02, max(0.0, wait_end - time.time())))
+
+            ok, _ = safe_set_slave_target_7d(
+                slave,
+                point["q"],
+                point["tool"],
+                PV_VEL_LIM,
+                TOOL_PV_VEL_LIM,
+                idx,
+            )
+            if not ok:
+                print(f"[WARN] 第 {idx} 个轨迹点写入失败，继续尝试后续轨迹点")
+
+            if idx > 0 and idx % 200 == 0:
+                print(f"[REPLAY] 已回放 {idx}/{len(points)} 个轨迹点")
+
+        last = points[-1]
+        end_time = time.time() + REPLAY_HOLD_LAST_S
+        while time.time() < end_time:
+            cmd = drain_latest_command(cmd_queue)
+            if cmd in (CMD_EXIT, CMD_TELEOP, CMD_RECORD, CMD_REPLAY):
+                next_cmd = cmd
+                return next_cmd
+
+            safe_set_slave_target_7d(
+                slave,
+                last["q"],
+                last["tool"],
+                PV_VEL_LIM,
+                TOOL_PV_VEL_LIM,
+                len(points),
+            )
+            time.sleep(0.02)
+
+        print("[REPLAY] 示教轨迹回放完成")
+        next_cmd = wait_for_next_command(cmd_queue, "示教回放已完成。请输入 1/2/3 切换模式，或输入 0 退出：")
+        return next_cmd
+
+    except KeyboardInterrupt:
+        print()
+        print("[WARN] 检测到 Ctrl+C，中断当前回放。建议正常使用键盘输入 0 退出。")
+        next_cmd = CMD_EXIT
+        return next_cmd
+
+    finally:
+        print("清理从端机械臂...")
+        try:
+            if slave is not None:
+                slave.cleanup()
+        except Exception as e:
+            print(f"[WARN] 从端清理异常: {e}")
+
+
+def mode_from_command(cmd):
+    if cmd == CMD_EXIT:
+        return None
+    if cmd not in CMD_TO_MODE:
+        return None
+    return CMD_TO_MODE[cmd]
+
+
+# =========================
+# 8. 主程序入口
+# =========================
+
+def main():
+    args = parse_args()
+
+    if args.mode == "menu":
+        current_cmd = choose_initial_command()
+    else:
+        current_cmd = MODE_TO_CMD[args.mode]
+
+    if current_cmd == CMD_EXIT:
+        print("已退出。")
+        return
+
+    cmd_queue = queue.Queue()
+    stop_event = threading.Event()
+    start_keyboard_listener(cmd_queue, stop_event)
+
+    try:
+        while current_cmd != CMD_EXIT:
+            current_mode = mode_from_command(current_cmd)
+            if current_mode is None:
+                print(f"[WARN] 未知命令: {current_cmd}，返回菜单等待输入")
+                current_cmd = wait_for_next_command(cmd_queue)
+                continue
+
+            print()
+            print(f"========== 当前模式：{MODE_CN_NAME[current_mode]} ==========")
+            print("运行中可输入 4/1/2/3 切换模式，输入 0 安全退出。")
+            print()
+
+            if current_mode == RUN_MODE_PREPARE:
+                current_cmd = run_prepare_session(
+                    cmd_queue,
+                    record_file=args.record_file,
+                    enable_camera_recording=(not args.no_camera_record),
+                    camera_recorder=None,
+                )
+            elif current_mode in (RUN_MODE_TELEOP, RUN_MODE_RECORD):
+                # 不在这里提前创建 episode；真正进入记录模式时由 enter_record_mode() 创建。
+                current_cmd = run_teleop_record_session(cmd_queue, current_mode, args.record_file, enable_camera_recording=(not args.no_camera_record))
+            elif current_mode == RUN_MODE_REPLAY:
+                replay_file = resolve_replay_file_path(args.replay_file) or LAST_RECORD_FILE or find_latest_teach_record_file()
+
+                if replay_file is None:
+                    print("[ERR] 未指定回放文件，也没有在 data/episode_xx/trajectory 文件夹中找到 CSV。")
+                    print("[ERR] 请先输入 2 进入遥操作记录模式生成轨迹文件，")
+                    print("[ERR] 或者运行程序时使用 --replay-file 手动指定轨迹文件。")
+                    current_cmd = wait_for_next_command(
+                        cmd_queue,
+                        "请输入 1/2 切换到遥操作或记录模式，或输入 0 退出："
+                    )
+                    continue
+
+                print(f"[REPLAY] 本次使用的回放文件: {replay_file}")
+
+                current_cmd = run_replay_session(
+                    cmd_queue,
+                    replay_file,
+                    replay_source=args.replay_source,
+                    replay_speed=args.replay_speed,
+                )
+            else:
+                raise RuntimeError(f"未知运行模式: {current_mode}")
+
+            if current_cmd is None:
+                current_cmd = wait_for_next_command(cmd_queue)
+
+        print("[EXIT] 收到退出命令，程序已安全结束")
+
+    finally:
+        stop_event.set()
+
+
+if __name__ == "__main__":
+    main()
