@@ -8,9 +8,7 @@ import threading
 import time
 import traceback
 from typing import Optional, List
-
 from intelrealsense_episode_recorder import D435iRecorder
-
 from PySide6.QtCore import QObject, Signal, Qt, QTimer
 from PySide6.QtGui import QTextCursor, QImage, QPixmap
 from PySide6.QtWidgets import (
@@ -32,7 +30,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 try:
     import teleoperation_dualpv_episode_collection as core
 except Exception as exc:  # pragma: no cover - only used at runtime on user machine
