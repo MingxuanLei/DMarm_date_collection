@@ -505,9 +505,9 @@ class MainWindow(QMainWindow):
         outer_layout.setContentsMargins(8, 8, 8, 8)
         outer_layout.setSpacing(6)
 
-        master_defaults = [3.10, -1.70, -3.10, -0.10, 1.56, 0.25]
-        slave_defaults = [3.10, -1.60, -3.10, 0.00, 1.56, 0.25]
-        master_tool_default = -2.9
+        master_defaults = [3.10, -1.70, -3.10, 0.0, 1.5, 0.0]
+        slave_defaults = [3.10, -1.65, -3.10, 0.00, 1.5, 0.0]
+        master_tool_default = 0.0
         slave_tool_default = 0.0
 
         def build_target_table(title: str, defaults: List[float], tool_default: float):
