@@ -1,0 +1,57 @@
+{
+  "camera": "Intel RealSense D435i",
+  "stream": "color+depth_aligned_to_color",
+  "color_width": 640,
+  "color_height": 480,
+  "depth_width": 640,
+  "depth_height": 480,
+  "fps": 30,
+  "depth_scale_m_per_unit": 0.0010000000474974513,
+  "video_codec": "mp4v",
+  "save_color_video": true,
+  "save_depth_video": false,
+  "yolo_model_path": "yolov8n.pt",
+  "yolo_confidence": 0.5,
+  "yolo_iou": 0.45,
+  "yolo_imgsz": 640,
+  "depth_estimator": "median of valid depth in center ROI of bbox",
+  "color_intrinsics": {
+    "width": 640,
+    "height": 480,
+    "ppx": 324.9102783203125,
+    "ppy": 241.38693237304688,
+    "fx": 607.3409423828125,
+    "fy": 607.199462890625,
+    "model": "distortion.inverse_brown_conrady",
+    "coeffs": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "depth_intrinsics": {
+    "width": 640,
+    "height": 480,
+    "ppx": 324.12298583984375,
+    "ppy": 240.60842895507812,
+    "fx": 389.6905822753906,
+    "fy": 389.6905822753906,
+    "model": "distortion.brown_conrady",
+    "coeffs": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "record_stem": "teach_record_20260710_212833",
+  "record_start_time_system_s": 1783690113.8715289,
+  "video_dir": "d:\\Users\\lmxlegion\\Desktop\\My personal project\\DMarm_date_collection\\data\\episode_03\\video",
+  "color_video_path": "d:\\Users\\lmxlegion\\Desktop\\My personal project\\DMarm_date_collection\\data\\episode_03\\video\\teach_record_20260710_212833_color.mp4",
+  "timestamp_csv_path": "d:\\Users\\lmxlegion\\Desktop\\My personal project\\DMarm_date_collection\\data\\episode_03\\video\\teach_record_20260710_212833_camera_timestamps.csv",
+  "detection_csv_path": "d:\\Users\\lmxlegion\\Desktop\\My personal project\\DMarm_date_collection\\data\\episode_03\\video\\teach_record_20260710_212833_object_detections.csv",
+  "created_time_local": "2026-07-10 21:28:33"
+}
