@@ -507,8 +507,8 @@ class MainWindow(QMainWindow):
 
         master_defaults = [3.10, -1.70, -3.10, 0.0, 1.5, 0.0]
         slave_defaults = [3.10, -1.65, -3.10, 0.00, 1.5, 0.0]
-        master_tool_default = 0.0
-        slave_tool_default = 0.0
+        master_tool_default = 1.0
+        slave_tool_default = 2.58
 
         def build_target_table(title: str, defaults: List[float], tool_default: float):
             group = QGroupBox(title)
