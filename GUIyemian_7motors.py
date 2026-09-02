@@ -54,7 +54,7 @@ ARM_DOF = 6
 TOTAL_MOTOR_NUM = 7
 
 # 与 test_control.py 保持一致：默认补偿 2~5 轴；第 7 个工具电机不参与机械臂重力补偿
-GRAVITY_TORQUE_SCALE = [0.0, 1.5, 1.35, 3.0, 3.0, 0.0]
+GRAVITY_TORQUE_SCALE = [0.0, 1.1, 1.1, 1.2, 1.1, 0.0]
 
 DEFAULT_PV_TARGET_DH_Q = [
     3.10,
